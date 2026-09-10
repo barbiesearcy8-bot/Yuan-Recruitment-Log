@@ -773,9 +773,11 @@ function uid(){ return 'id_'+Date.now()+'_'+Math.random().toString(36).slice(2,7
 // ==================== 保底与统计 ====================
 const DB_VERSION = 'v28';
 function checkVersion(){
+  // 版本号不匹配时不再清空数据！数据格式迁移由 migrateOldData() 处理
+  // 清空 localStorage 会导致用户导入的备份数据丢失，这是之前刷新丢数据的根本原因
   if(DB.get('gy_version','') !== DB_VERSION){
-    Object.keys(localStorage).filter(k=>k.startsWith('gy_')).forEach(k=>localStorage.removeItem(k));
     DB.set('gy_version', DB_VERSION);
+    console.log('[版本] 已更新为 '+DB_VERSION+'（保留原有数据，由 migrateOldData 处理格式迁移）');
   }
 }
 
@@ -1264,6 +1266,9 @@ function renderManage(){
         <div class="mg-meta">${cards.length} 个密探 · 添加 / 编辑 / 排序 / 头像图</div>
       </div>
       <div class="mg-arrow">›</div>
+    </div>
+    <div style="text-align:center;margin-top:20px;padding-top:12px;border-top:1px solid #E8DCC8;font-size:11px;color:#B8A88A;">
+      版本 ${DB_VERSION} · 数据持久化修复版 · 导入后刷新不丢数据
     </div>
   </div>`;
 }
@@ -2310,11 +2315,22 @@ function importData(file){
     try{
       const data = JSON.parse(e.target.result);
       await applyData(data);
-      toast('导入成功，数据已保存');
+      // 导入后立即验证数据是否真的写入了 localStorage
+      const verify = {
+        identities: getIdentities().length,
+        cards: getCards().length,
+        pools: getPools().length,
+        records: getRecords().length
+      };
+      const msg = `导入成功：${verify.cards}密探/${verify.pools}卡池/${verify.records}记录，已保存到本地`;
+      console.log('[导入验证]', verify);
+      toast(msg, 3000);
       state.modal = null;
       const ids = getIdentities();
       if(ids.length>0) state.currentIdentityId = ids[0].id;
       render();
+      // 再做一次全量备份，确保 IndexedDB 有数据
+      setTimeout(()=>backupAllDataToIdb(), 500);
     }catch(err){ console.error('导入失败:', err); toast('导入失败：文件格式错误'); }
   };
   reader.readAsText(file);
@@ -2658,10 +2674,10 @@ function initDemo(){
   }
 }
 
-checkVersion();
 initAccountSession();
-// 先从 IndexedDB 备份恢复数据（防止 localStorage 被清），再执行迁移和初始化
+// 先从 IndexedDB 备份恢复数据（防止 localStorage 被清），再检查版本、迁移和初始化
 restoreDataFromIdb().then(()=>{
+  checkVersion();
   migrateOldData();
   initDemo();
   const _ids = getIdentities();
