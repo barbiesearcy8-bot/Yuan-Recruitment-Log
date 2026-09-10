@@ -356,6 +356,12 @@ const CATEGORY_COLORS = ['#e6d800','#B8860B','#8E44AD','#a1b7e6','#16A085','#C21
 // 旧版本数据迁移：如鸢→代号鸢，稀有度旧值→新两级体系
 function migrateOldData(){
   let changed = false;
+  // 迁移 identities 的 game 字段
+  const ids = getIdentities();
+  ids.forEach(i=>{
+    if(i.game==='如鸢' || !i.game){ i.game='代号鸢'; changed=true; }
+  });
+  if(changed) saveIdentities(ids);
   const cards = getCards();
   cards.forEach(c=>{
     if(c.game==='如鸢'){ c.game='代号鸢'; changed=true; }
@@ -368,7 +374,8 @@ function migrateOldData(){
   const pools = getPools();
   pools.forEach(p=>{
     if(p.game==='如鸢'){ p.game='代号鸢'; changed=true; }
-    if(p.category===undefined){ p.category=''; p.categoryColor=''; changed=true; }
+    if(p.category===undefined || p.category===null){ p.category=''; changed=true; }
+    if(p.categoryColor===undefined || p.categoryColor===null){ p.categoryColor='#B8860B'; changed=true; }
   });
   if(changed) savePools(pools);
 }
@@ -774,7 +781,7 @@ function uid(){ return 'id_'+Date.now()+'_'+Math.random().toString(36).slice(2,7
 const DB_VERSION = 'v28';
 function checkVersion(){
   // 版本号不匹配时不再清空数据！数据格式迁移由 migrateOldData() 处理
-  // 清空 localStorage 会导致用户导入的备份数据丢失，这是之前刷新丢数据的根本原因
+  // 清空 localStorage 会导致用户导入的备份数据丢失，这是刷新丢数据的根本原因
   if(DB.get('gy_version','') !== DB_VERSION){
     DB.set('gy_version', DB_VERSION);
     console.log('[版本] 已更新为 '+DB_VERSION+'（保留原有数据，由 migrateOldData 处理格式迁移）');
@@ -955,13 +962,33 @@ function setPoolCateFilter(v){ state.poolCateFilter=v; render(); }
 
 // ---- 总览页 ----
 function renderOverview(){
-  const id = getCurrentIdentity();
+  // 自动修复：如果当前账号ID无效但有账号数据，自动切换到第一个账号
+  let id = getCurrentIdentity();
+  if(!id){
+    const ids = getIdentities();
+    if(ids.length>0){
+      state.currentIdentityId = ids[0].id;
+      id = ids[0];
+      console.log('[自动修复] 切换到第一个账号:', id.name);
+    }
+  }
   let pools, recs, s;
   if(id){
-    pools = orderPools(sortPoolsForDisplay(getGamePools(id.game)));
+    // 按游戏过滤卡池；如果过滤后为空但实际有卡池数据，自动显示所有卡池（兼容旧数据game字段不匹配）
+    let gamePools = getGamePools(id.game);
+    if(gamePools.length===0 && getPools().length>0){
+      console.log('[自动修复] game字段不匹配，显示全部卡池');
+      gamePools = getPools();
+    }
+    pools = orderPools(sortPoolsForDisplay(gamePools));
     if(state.poolFilter==='常驻') pools = pools.filter(p=>p.type==='常驻');
     else if(state.poolFilter==='UP') pools = pools.filter(p=>p.type==='UP');
+    // 获取当前账号的记录；如果为空但有记录数据，尝试显示所有记录（兼容旧数据identityId不匹配）
     recs = getIdentityRecords(id.id);
+    if(recs.length===0 && getRecords().length>0){
+      console.log('[自动修复] identityId不匹配，显示全部记录');
+      recs = getRecords();
+    }
     s = calcStats(recs, pools);
   } else {
     pools = []; recs = [];
@@ -971,6 +998,17 @@ function renderOverview(){
   return `
   ${renderHeader()}
   <div class="overview">
+
+    <div style="background:linear-gradient(135deg,#FFF8E1,#FFECB3);border:1px solid #FFD54F;border-radius:12px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#5D4037;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;">
+        <span style="font-weight:600;">💾 数据保存状态</span>
+        <span id="data_save_status" style="color:#2E7D32;font-weight:600;">● 已保存到本地</span>
+      </div>
+      <div style="margin-top:6px;color:#795548;">
+        当前：${getCards().length} 密探 / ${getPools().length} 卡池 / ${getRecords().length} 记录 / ${getIdentities().length} 账号
+        <span style="margin-left:8px;color:#9E9E9E;">（数据存在浏览器本地，刷新不丢失）</span>
+      </div>
+    </div>
 
     <div class="big-stats">
       <div class="big-stat">
@@ -2273,7 +2311,6 @@ async function backupAllDataToIdb(){
       if(v!==null && v!==undefined){ tasks.push(dataIdbPut(k, v)); }
     }catch(e){}
   }
-  // 等待图片写入完成
   for(const id in imgCache.pool){ if(imgCache.pool[id]) tasks.push(idbPut(id, imgCache.pool[id])); }
   for(const id in imgCache.card){ if(imgCache.card[id]) tasks.push(idbPut(id, imgCache.card[id])); }
   await Promise.allSettled(tasks);
@@ -2282,7 +2319,26 @@ async function backupAllDataToIdb(){
 async function applyData(data){
   if(data.identities) saveIdentities(data.identities);
   if(data.cards) saveCards(data.cards);
-  if(data.pools) savePools(data.pools);
+  if(data.pools){
+    // 导入卡池时保护分类气泡数据：如果新数据缺少 category/categoryColor，保留旧数据中的值
+    const oldPools = getPools();
+    const oldPoolMap = {};
+    oldPools.forEach(p=>{ oldPoolMap[p.id] = p; oldPoolMap[p.name] = p; });
+    const mergedPools = data.pools.map(p=>{
+      const old = oldPoolMap[p.id] || oldPoolMap[p.name];
+      if(old){
+        // 保留旧数据中的分类和颜色（如果新数据中缺失）
+        if(p.category===undefined || p.category===null) p.category = old.category || '';
+        if(p.categoryColor===undefined || p.categoryColor===null || p.categoryColor==='') p.categoryColor = old.categoryColor || '#B8860B';
+      } else {
+        // 旧数据中没有的卡池，确保分类字段存在
+        if(p.category===undefined || p.category===null) p.category = '';
+        if(p.categoryColor===undefined || p.categoryColor===null || p.categoryColor==='') p.categoryColor = '#B8860B';
+      }
+      return p;
+    });
+    savePools(mergedPools);
+  }
   if(data.records) saveRecords(data.records);
   if(data.userPoolPity) saveUserPoolPityAll(data.userPoolPity);
   if(data.cardOrder!==undefined) saveCardOrder(data.cardOrder);
@@ -2315,22 +2371,26 @@ function importData(file){
     try{
       const data = JSON.parse(e.target.result);
       await applyData(data);
-      // 导入后立即验证数据是否真的写入了 localStorage
-      const verify = {
-        identities: getIdentities().length,
-        cards: getCards().length,
-        pools: getPools().length,
-        records: getRecords().length
+      // 导入后立即从 localStorage 重新读取验证（不是从内存，是真的从存储读）
+      const verifyLs = {
+        identities: JSON.parse(localStorage.getItem('gy_identities')||'[]').length,
+        cards: JSON.parse(localStorage.getItem('gy_cards')||'[]').length,
+        pools: JSON.parse(localStorage.getItem('gy_pools')||'[]').length,
+        records: JSON.parse(localStorage.getItem('gy_records')||'[]').length
       };
-      const msg = `导入成功：${verify.cards}密探/${verify.pools}卡池/${verify.records}记录，已保存到本地`;
-      console.log('[导入验证]', verify);
-      toast(msg, 3000);
+      const msg = `导入成功：${verifyLs.cards}密探/${verifyLs.pools}卡池/${verifyLs.records}记录，已写入本地存储`;
+      console.log('[导入验证-localStorage]', verifyLs);
+      toast(msg, 4000);
       state.modal = null;
       const ids = getIdentities();
       if(ids.length>0) state.currentIdentityId = ids[0].id;
       render();
-      // 再做一次全量备份，确保 IndexedDB 有数据
-      setTimeout(()=>backupAllDataToIdb(), 500);
+      // 更新页面上的保存状态显示
+      const statusEl = document.getElementById('data_save_status');
+      if(statusEl){ statusEl.textContent = '● 刚刚导入并保存 ✓'; statusEl.style.color='#2E7D32'; }
+      // 再做一次全量备份到 IndexedDB，确保双写
+      await backupAllDataToIdb();
+      console.log('[导入] IndexedDB 双写备份完成');
     }catch(err){ console.error('导入失败:', err); toast('导入失败：文件格式错误'); }
   };
   reader.readAsText(file);
@@ -2578,99 +2638,81 @@ const RUYUAN_CARDS = [
 ];
 
 function initDemo(){
-  // ===== 增量合并密探：按名称匹配，已有保留（含用户编辑/图片），缺失新增 =====
-  const existingCards = getCards();
-  const existingCardNames = new Set(existingCards.map(c=>c.name));
-  const _ts = Date.now();
-  const newCards = RUYUAN_CARDS
-    .filter(c=>!existingCardNames.has(c[0]))
-    .map((c,i)=>({
-      id:'card_'+_ts+'_'+i, name:c[0], game:'代号鸢',
+  // 预置代号鸢全部密探（如果还没有）
+  if(getCards().length===0){
+    const cards = RUYUAN_CARDS.map((c,i)=>({
+      id:'card_'+(i+1), name:c[0], game:'代号鸢',
       rarity: (c[3]==='绝密') ? RARITY_SSR : RARITY_NORMAL,
       element:c[1], profession:c[2]
     }));
-  if(newCards.length>0){
-    saveCards([...existingCards, ...newCards]);
-    console.log('[初始化] 新增密探 '+newCards.length+' 位：'+newCards.map(c=>c.name).join('、'));
+    saveCards(cards);
   }
-  
-  // ===== 增量合并卡池：按名称匹配，已有保留，缺失新增 =====
-  const allCards = getCards();
-  const cardMap = {};
-  allCards.forEach(c=>cardMap[c.name]=c.id);
-  function upIds(names){ return names.map(n=>cardMap[n]).filter(Boolean); }
-  
-  // 预置卡池定义（56个：3常驻+53UP）
-  const PRESET_POOLS = [
-    {name:'绣衣天下', type:'常驻', upNames:[], color:'#2a2a2a'},
-    {name:'东阁待贤', type:'常驻', upNames:[], color:'#2a2a2a'},
-    {name:'游说贤士', type:'常驻', upNames:[], color:'#2a2a2a'},
-    {name:'弓箭江东', type:'UP', upNames:['孙权','孙尚香'], color:'#8B4513'},
-    {name:'鬼城之主', type:'UP', upNames:['张修','干吉'], color:'#8B4513'},
-    {name:'异才奇士', type:'UP', upNames:['郭嘉','王粲'], color:'#8B4513'},
-    {name:'万物化光', type:'UP', upNames:['张辽','张仲景','小乔'], color:'#8B4513'},
-    {name:'山有扶苏', type:'UP', upNames:['周瑜','葛洪','许曼'], color:'#8B4513'},
-    {name:'四方顺时', type:'UP', upNames:['华佗','郭解'], color:'#8B4513'},
-    {name:'王佐之才', type:'UP', upNames:['庞统','荀彧','陆绩'], color:'#8B4513'},
-    {name:'坐照运筹', type:'UP', upNames:['贾诩','陆逊'], color:'#8B4513'},
-    {name:'诗画同律', type:'UP', upNames:['蔡琰','张飞'], color:'#8B4513'},
-    {name:'争光日月', type:'UP', upNames:['夏侯惇','张角','王异'], color:'#8B4513'},
-    {name:'度势攻心', type:'UP', upNames:['杨修','吕蒙'], color:'#8B4513'},
-    {name:'出奇无穷', type:'UP', upNames:['程昱','马超'], color:'#8B4513'},
-    {name:'天曲日术', type:'UP', upNames:['太史慈','张闿'], color:'#8B4513'},
-    {name:'扬矢摧锋', type:'UP', upNames:['孙尚香','张辽'], color:'#8B4513'},
-    {name:'绝艳惊鸿', type:'UP', upNames:['徐庶','张郃'], color:'#8B4513'},
-    {name:'击金鸣鼓', type:'UP', upNames:['甄宓','甘宁'], color:'#8B4513'},
-    {name:'秉数而一', type:'UP', upNames:['孙权','张仲景'], color:'#8B4513'},
-    {name:'闻斯行诸', type:'UP', upNames:['孔融','张鲁'], color:'#8B4513'},
-    {name:'天门启阖', type:'UP', upNames:['黄月英','张邈'], color:'#8B4513'},
-    {name:'谨司天英', type:'UP', upNames:['曹植','董奉'], color:'#8B4513'},
-    {name:'云雨滂润', type:'UP', upNames:['诸葛诞','诸葛瑾'], color:'#8B4513'},
-    {name:'二柄刑德', type:'UP', upNames:['满宠','荀攸'], color:'#8B4513'},
-    {name:'照以三光', type:'UP', upNames:['张闿','张飞'], color:'#8B4513'},
-    {name:'腾陵张胆', type:'UP', upNames:['凌统','安期'], color:'#8B4513'},
-    {name:'逐奔不远', type:'UP', upNames:['刘繇','戏学'], color:'#8B4513'},
-    {name:'动如雷霆', type:'UP', upNames:['马超','张辽'], color:'#8B4513'},
-    {name:'一体盈虚', type:'UP', upNames:['马腾','令狐茂'], color:'#8B4513'},
-    {name:'搏鸷缚虬', type:'UP', upNames:['朱然','黄盖'], color:'#8B4513'},
-    {name:'风兴云蒸', type:'UP', upNames:['蒯越','祢衡'], color:'#8B4513'},
-    {name:'火中取梦', type:'UP', upNames:['张郃','甄宓'], color:'#8B4513'},
-    {name:'深水逐鹿', type:'UP', upNames:['刘豹','张绣'], color:'#8B4513'},
-    {name:'白日昭只', type:'UP', upNames:['董白','张昭'], color:'#8B4513'},
-    {name:'隧象衔尾', type:'UP', upNames:['程普','士燮'], color:'#8B4513'},
-    {name:'暮燕翻雷', type:'UP', upNames:['张燕','虞翻'], color:'#8B4513'},
-    {name:'金相玉质', type:'UP', upNames:['孔融','黄月英'], color:'#8B4513'},
-    {name:'渊鼓锽钟', type:'UP', upNames:['夏侯渊','钟繇'], color:'#8B4513'},
-    {name:'劫烬灰飞', type:'UP', upNames:['刘璋','庞羲'], color:'#8B4513'},
-    {name:'以奉嘉觞', type:'UP', upNames:['周忠','吕布'], color:'#8B4513'},
-    {name:'大和丕应', type:'UP', upNames:['曹丕','简雍'], color:'#8B4513'},
-    {name:'英徽弥亮', type:'UP', upNames:['诸葛亮','司马徽'], color:'#8B4513'},
-    {name:'动静非我', type:'UP', upNames:['蒯良','郭女王'], color:'#8B4513'},
-    {name:'持心离欲', type:'UP', upNames:['法正','陈群'], color:'#8B4513'},
-    {name:'抱琴载酒', type:'UP', upNames:['周瑜','孙尚香'], color:'#8B4513'},
-    {name:'洪匀玄机', type:'UP', upNames:['葛洪','张仲景'], color:'#8B4513'},
-    {name:'珠玑琼玖', type:'UP', upNames:['酆公珠','酆公玖'], color:'#8B4513'},
-    {name:'坐令干霄', type:'UP', upNames:['卢植','庞德'], color:'#8B4513'},
-    {name:'影迹陈陈', type:'UP', upNames:['陈纪','陈应'], color:'#8B4513'},
-    {name:'含明隐迹', type:'UP', upNames:['孙静','孟获'], color:'#8B4513'},
-    {name:'松桥辅德', type:'UP', upNames:['张松','孙辅'], color:'#8B4513'},
-    {name:'奉天华盖', type:'UP', upNames:['董奉','黄盖'], color:'#8B4513'},
-    {name:'却月凌风', type:'UP', upNames:['黄月英','凌统'], color:'#8B4513'},
-    {name:'诚之云孚', type:'UP', upNames:['司马孚','赵云'], color:'#8B4513'},
-    {name:'周庙之璋', type:'UP', upNames:['周泰','陈琳'], color:'#8B4513'},
-  ];
-  
-  const existingPools = getPools();
-  const existingPoolNames = new Set(existingPools.map(p=>p.name));
-  const newPools = PRESET_POOLS
-    .filter(p=>!existingPoolNames.has(p.name))
-    .map((p,i)=>({
-      id:'pool_'+_ts+'_'+i, name:p.name, game:'代号鸢',
-      type:p.type, upCardIds: upIds(p.upNames), color:p.color
-    }));
-  if(newPools.length>0){
-    savePools([...existingPools, ...newPools]);
-    console.log('[初始化] 新增卡池 '+newPools.length+' 个：'+newPools.map(p=>p.name).join('、'));
+  // 预置全部卡池（如果还没有）
+  if(getPools().length===0){
+    const cards = getCards();
+    const cardMap = {};
+    cards.forEach(c=>cardMap[c.name]=c.id);
+    function upIds(names){ return names.map(n=>cardMap[n]).filter(Boolean); }
+  // 预置全部卡池（56个：3常驻+53UP）
+  const pools = [
+    {id:'pool_01', name:'绣衣天下', game:'代号鸢', type:'常驻', upCardIds:[], color:'#2a2a2a'},
+    {id:'pool_02', name:'东阁待贤', game:'代号鸢', type:'常驻', upCardIds:[], color:'#2a2a2a'},
+    {id:'pool_03', name:'游说贤士', game:'代号鸢', type:'常驻', upCardIds:[], color:'#2a2a2a'},
+    {id:'pool_04', name:'弓箭江东', game:'代号鸢', type:'UP', upCardIds:upIds(['孙权','孙尚香']), color:'#8B4513'},
+    {id:'pool_05', name:'鬼城之主', game:'代号鸢', type:'UP', upCardIds:upIds(['张修','干吉']), color:'#8B4513'},
+    {id:'pool_06', name:'异才奇士', game:'代号鸢', type:'UP', upCardIds:upIds(['郭嘉','王粲']), color:'#8B4513'},
+    {id:'pool_07', name:'万物化光', game:'代号鸢', type:'UP', upCardIds:upIds(['张辽','张仲景','小乔']), color:'#8B4513'},
+    {id:'pool_08', name:'山有扶苏', game:'代号鸢', type:'UP', upCardIds:upIds(['周瑜','葛洪','许曼']), color:'#8B4513'},
+    {id:'pool_09', name:'四方顺时', game:'代号鸢', type:'UP', upCardIds:upIds(['华佗','郭解']), color:'#8B4513'},
+    {id:'pool_10', name:'王佐之才', game:'代号鸢', type:'UP', upCardIds:upIds(['庞统','荀彧','陆绩']), color:'#8B4513'},
+    {id:'pool_11', name:'坐照运筹', game:'代号鸢', type:'UP', upCardIds:upIds(['贾诩','陆逊']), color:'#8B4513'},
+    {id:'pool_12', name:'诗画同律', game:'代号鸢', type:'UP', upCardIds:upIds(['蔡琰','张飞']), color:'#8B4513'},
+    {id:'pool_13', name:'争光日月', game:'代号鸢', type:'UP', upCardIds:upIds(['夏侯惇','张角','王异']), color:'#8B4513'},
+    {id:'pool_14', name:'度势攻心', game:'代号鸢', type:'UP', upCardIds:upIds(['杨修','吕蒙']), color:'#8B4513'},
+    {id:'pool_15', name:'出奇无穷', game:'代号鸢', type:'UP', upCardIds:upIds(['程昱','马超']), color:'#8B4513'},
+    {id:'pool_16', name:'天曲日术', game:'代号鸢', type:'UP', upCardIds:upIds(['太史慈','张闿']), color:'#8B4513'},
+    {id:'pool_17', name:'扬矢摧锋', game:'代号鸢', type:'UP', upCardIds:upIds(['孙尚香','张辽']), color:'#8B4513'},
+    {id:'pool_18', name:'绝艳惊鸿', game:'代号鸢', type:'UP', upCardIds:upIds(['徐庶','张郃']), color:'#8B4513'},
+    {id:'pool_19', name:'击金鸣鼓', game:'代号鸢', type:'UP', upCardIds:upIds(['甄宓','甘宁']), color:'#8B4513'},
+    {id:'pool_20', name:'秉数而一', game:'代号鸢', type:'UP', upCardIds:upIds(['孙权','张仲景']), color:'#8B4513'},
+    {id:'pool_21', name:'闻斯行诸', game:'代号鸢', type:'UP', upCardIds:upIds(['孔融','张鲁']), color:'#8B4513'},
+    {id:'pool_22', name:'天门启阖', game:'代号鸢', type:'UP', upCardIds:upIds(['黄月英','张邈']), color:'#8B4513'},
+    {id:'pool_23', name:'谨司天英', game:'代号鸢', type:'UP', upCardIds:upIds(['曹植','董奉']), color:'#8B4513'},
+    {id:'pool_24', name:'云雨滂润', game:'代号鸢', type:'UP', upCardIds:upIds(['诸葛诞','诸葛瑾']), color:'#8B4513'},
+    {id:'pool_25', name:'二柄刑德', game:'代号鸢', type:'UP', upCardIds:upIds(['满宠','荀攸']), color:'#8B4513'},
+    {id:'pool_26', name:'照以三光', game:'代号鸢', type:'UP', upCardIds:upIds(['张闿','张飞']), color:'#8B4513'},
+    {id:'pool_27', name:'腾陵张胆', game:'代号鸢', type:'UP', upCardIds:upIds(['凌统','安期']), color:'#8B4513'},
+    {id:'pool_28', name:'逐奔不远', game:'代号鸢', type:'UP', upCardIds:upIds(['刘繇','戏学']), color:'#8B4513'},
+    {id:'pool_29', name:'动如雷霆', game:'代号鸢', type:'UP', upCardIds:upIds(['马超','张辽']), color:'#8B4513'},
+    {id:'pool_30', name:'一体盈虚', game:'代号鸢', type:'UP', upCardIds:upIds(['马腾','令狐茂']), color:'#8B4513'},
+    {id:'pool_31', name:'搏鸷缚虬', game:'代号鸢', type:'UP', upCardIds:upIds(['朱然','黄盖']), color:'#8B4513'},
+    {id:'pool_32', name:'风兴云蒸', game:'代号鸢', type:'UP', upCardIds:upIds(['蒯越','祢衡']), color:'#8B4513'},
+    {id:'pool_33', name:'火中取梦', game:'代号鸢', type:'UP', upCardIds:upIds(['张郃','甄宓']), color:'#8B4513'},
+    {id:'pool_34', name:'深水逐鹿', game:'代号鸢', type:'UP', upCardIds:upIds(['刘豹','张绣']), color:'#8B4513'},
+    {id:'pool_35', name:'白日昭只', game:'代号鸢', type:'UP', upCardIds:upIds(['董白','张昭']), color:'#8B4513'},
+    {id:'pool_36', name:'隧象衔尾', game:'代号鸢', type:'UP', upCardIds:upIds(['程普','士燮']), color:'#8B4513'},
+    {id:'pool_37', name:'暮燕翻雷', game:'代号鸢', type:'UP', upCardIds:upIds(['张燕','虞翻']), color:'#8B4513'},
+    {id:'pool_38', name:'金相玉质', game:'代号鸢', type:'UP', upCardIds:upIds(['孔融','黄月英']), color:'#8B4513'},
+    {id:'pool_39', name:'渊鼓锽钟', game:'代号鸢', type:'UP', upCardIds:upIds(['夏侯渊','钟繇']), color:'#8B4513'},
+    {id:'pool_40', name:'劫烬灰飞', game:'代号鸢', type:'UP', upCardIds:upIds(['刘璋','庞羲']), color:'#8B4513'},
+    {id:'pool_41', name:'以奉嘉觞', game:'代号鸢', type:'UP', upCardIds:upIds(['周忠','吕布']), color:'#8B4513'},
+    {id:'pool_42', name:'大和丕应', game:'代号鸢', type:'UP', upCardIds:upIds(['曹丕','简雍']), color:'#8B4513'},
+    {id:'pool_43', name:'英徽弥亮', game:'代号鸢', type:'UP', upCardIds:upIds(['诸葛亮','司马徽']), color:'#8B4513'},
+    {id:'pool_44', name:'动静非我', game:'代号鸢', type:'UP', upCardIds:upIds(['蒯良','郭女王']), color:'#8B4513'},
+    {id:'pool_45', name:'持心离欲', game:'代号鸢', type:'UP', upCardIds:upIds(['法正','陈群']), color:'#8B4513'},
+    {id:'pool_46', name:'抱琴载酒', game:'代号鸢', type:'UP', upCardIds:upIds(['周瑜','孙尚香']), color:'#8B4513'},
+    {id:'pool_47', name:'洪匀玄机', game:'代号鸢', type:'UP', upCardIds:upIds(['葛洪','张仲景']), color:'#8B4513'},
+    {id:'pool_48', name:'珠玑琼玖', game:'代号鸢', type:'UP', upCardIds:upIds(['酆公珠','酆公玖']), color:'#8B4513'},
+    {id:'pool_49', name:'坐令干霄', game:'代号鸢', type:'UP', upCardIds:upIds(['卢植','庞德']), color:'#8B4513'},
+    {id:'pool_50', name:'影迹陈陈', game:'代号鸢', type:'UP', upCardIds:upIds(['陈纪','陈应']), color:'#8B4513'},
+    {id:'pool_51', name:'含明隐迹', game:'代号鸢', type:'UP', upCardIds:upIds(['孙静','孟获']), color:'#8B4513'},
+    {id:'pool_52', name:'松桥辅德', game:'代号鸢', type:'UP', upCardIds:upIds(['张松','孙辅']), color:'#8B4513'},
+    {id:'pool_53', name:'奉天华盖', game:'代号鸢', type:'UP', upCardIds:upIds(['董奉','黄盖']), color:'#8B4513'},
+    {id:'pool_54', name:'却月凌风', game:'代号鸢', type:'UP', upCardIds:upIds(['黄月英','凌统']), color:'#8B4513'},
+    {id:'pool_55', name:'诚之云孚', game:'代号鸢', type:'UP', upCardIds:upIds(['司马孚','赵云']), color:'#8B4513'},
+    {id:'pool_56', name:'周庙之璋', game:'代号鸢', type:'UP', upCardIds:upIds(['周泰','陈琳']), color:'#8B4513'},
+    ];
+    savePools(pools);
   }
 }
 
